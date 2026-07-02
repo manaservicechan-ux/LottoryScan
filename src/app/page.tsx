@@ -1,27 +1,36 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { preprocessForOcr, extractSixDigitCandidates } from '@/lib/ocr';
 
-type ScanStep = 'idle' | 'cropping' | 'processing' | 'review';
-type Rect = { x: number; y: number; w: number; h: number };
 type ScannedItem = { id: string; number: string };
+type OcrWorker = {
+  recognize: (image: HTMLCanvasElement) => Promise<{ data: { text: string } }>;
+  terminate: () => Promise<unknown>;
+};
 
 const STORAGE_KEY = 'lottery-scan-items';
+// guide box as a fraction of the video frame (wide, short strip in the middle)
+const GUIDE = { x: 0.08, y: 0.4, w: 0.84, h: 0.2 };
+const STREAK_TO_CONFIRM = 2;
+const COOLDOWN_MS = 1800;
 
 export default function ScanPage() {
-  const [step, setStep] = useState<ScanStep>('idle');
-  const [imgUrl, setImgUrl] = useState<string | null>(null);
-  const [rect, setRect] = useState<Rect | null>(null);
-  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
-  const [candidates, setCandidates] = useState<string[]>([]);
+  const [camOn, setCamOn] = useState(false);
+  const [camError, setCamError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [liveGuess, setLiveGuess] = useState<string | null>(null);
+  const [flash, setFlash] = useState<string | null>(null);
   const [manualNumber, setManualNumber] = useState('');
   const [items, setItems] = useState<ScannedItem[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [videoSize, setVideoSize] = useState<{ w: number; h: number } | null>(null);
 
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const imgRef = useRef<HTMLImageElement>(null);
-  const imgBoxRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const workerRef = useRef<OcrWorker | null>(null);
+  const loopActiveRef = useRef(false);
+  const lastGuessRef = useRef<string | null>(null);
+  const streakRef = useRef(0);
+  const cooldownUntilRef = useRef(0);
 
   useEffect(() => {
     try {
@@ -36,113 +45,119 @@ export default function ScanPage() {
     } catch {}
   }, [items]);
 
-  function pickPhoto() {
-    fileInputRef.current?.click();
-  }
+  const addItem = useCallback((num: string) => {
+    setItems((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, number: num }]);
+    setFlash(num);
+    if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(120);
+    setTimeout(() => setFlash(null), 1200);
+  }, []);
 
-  function onFileChosen(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    setError(null);
-    setCandidates([]);
-    setManualNumber('');
-    const url = URL.createObjectURL(file);
-    setImgUrl(url);
-    setRect(null);
-    setStep('cropping');
-  }
+  const scanLoop = useCallback(async () => {
+    while (loopActiveRef.current) {
+      const video = videoRef.current;
+      const worker = workerRef.current;
+      if (!video || !worker || video.readyState < 2 || !video.videoWidth) {
+        await sleep(150);
+        continue;
+      }
+      if (Date.now() < cooldownUntilRef.current) {
+        await sleep(150);
+        continue;
+      }
+      try {
+        const sx = Math.round(GUIDE.x * video.videoWidth);
+        const sy = Math.round(GUIDE.y * video.videoHeight);
+        const sw = Math.round(GUIDE.w * video.videoWidth);
+        const sh = Math.round(GUIDE.h * video.videoHeight);
+        const cropCanvas = document.createElement('canvas');
+        cropCanvas.width = sw;
+        cropCanvas.height = sh;
+        const ctx = cropCanvas.getContext('2d')!;
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+        const processed = preprocessForOcr(cropCanvas);
 
-  function relPos(clientX: number, clientY: number) {
-    const box = imgBoxRef.current!.getBoundingClientRect();
-    const x = Math.min(Math.max(clientX - box.left, 0), box.width);
-    const y = Math.min(Math.max(clientY - box.top, 0), box.height);
-    return { x: x / box.width, y: y / box.height };
-  }
+        const { data } = await worker.recognize(processed);
+        const candidates = extractSixDigitCandidates(data.text || '');
+        const best = candidates[0] || null;
+        setLiveGuess(best);
 
-  function onDragStart(clientX: number, clientY: number) {
-    const p = relPos(clientX, clientY);
-    setDragStart(p);
-    setRect({ x: p.x, y: p.y, w: 0, h: 0 });
-  }
+        if (best && best === lastGuessRef.current) {
+          streakRef.current += 1;
+        } else {
+          streakRef.current = best ? 1 : 0;
+          lastGuessRef.current = best;
+        }
 
-  function onDragMove(clientX: number, clientY: number) {
-    if (!dragStart) return;
-    const p = relPos(clientX, clientY);
-    setRect({
-      x: Math.min(dragStart.x, p.x),
-      y: Math.min(dragStart.y, p.y),
-      w: Math.abs(p.x - dragStart.x),
-      h: Math.abs(p.y - dragStart.y),
-    });
-  }
+        if (best && streakRef.current >= STREAK_TO_CONFIRM) {
+          addItem(best);
+          streakRef.current = 0;
+          lastGuessRef.current = null;
+          setLiveGuess(null);
+          cooldownUntilRef.current = Date.now() + COOLDOWN_MS;
+        }
+      } catch {
+        // ignore a single failed frame, keep looping
+      }
+      await sleep(80);
+    }
+  }, [addItem]);
 
-  function onDragEnd() {
-    setDragStart(null);
-  }
-
-  async function runOcr(useFullImage: boolean) {
-    if (!imgRef.current) return;
-    setBusy(true);
-    setError(null);
+  async function startCamera() {
+    setCamError(null);
+    setStarting(true);
     try {
-      const img = imgRef.current;
-      const natW = img.naturalWidth;
-      const natH = img.naturalHeight;
-
-      const cropCanvas = document.createElement('canvas');
-      let sx = 0, sy = 0, sw = natW, sh = natH;
-      if (!useFullImage && rect && rect.w > 0.02 && rect.h > 0.02) {
-        sx = Math.round(rect.x * natW);
-        sy = Math.round(rect.y * natH);
-        sw = Math.round(rect.w * natW);
-        sh = Math.round(rect.h * natH);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
       }
-      cropCanvas.width = sw;
-      cropCanvas.height = sh;
-      const cctx = cropCanvas.getContext('2d')!;
-      cctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
 
-      const processed = preprocessForOcr(cropCanvas);
-
-      const { createWorker } = await import('tesseract.js');
-      const worker = await createWorker('eng');
-      await worker.setParameters({ tessedit_char_whitelist: '0123456789' });
-      const { data } = await worker.recognize(processed);
-      await worker.terminate();
-
-      const found = extractSixDigitCandidates(data.text || '');
-      setCandidates(found);
-      if (found.length === 0) {
-        setError('อ่านเลข 6 หลักไม่ได้ ลองครอบเฉพาะแถวเลขให้ชัดขึ้น หรือกรอกเอง');
+      if (!workerRef.current) {
+        const { createWorker } = await import('tesseract.js');
+        const worker = await createWorker('eng');
+        await worker.setParameters({ tessedit_char_whitelist: '0123456789' });
+        workerRef.current = worker;
       }
-      setStep('review');
+
+      setCamOn(true);
+      loopActiveRef.current = true;
+      scanLoop();
     } catch (err: any) {
-      setError('เกิดข้อผิดพลาดระหว่างอ่านภาพ: ' + (err?.message || String(err)));
-      setStep('review');
+      setCamError(
+        err?.name === 'NotAllowedError'
+          ? 'ไม่ได้รับอนุญาตให้ใช้กล้อง กรุณาอนุญาตการเข้าถึงกล้องแล้วลองใหม่'
+          : 'เปิดกล้องไม่สำเร็จ: ' + (err?.message || String(err))
+      );
     } finally {
-      setBusy(false);
+      setStarting(false);
     }
   }
 
-  function confirmNumber(num: string) {
-    const clean = num.trim();
-    if (!/^\d{6}$/.test(clean)) {
-      setError('เลขต้องเป็นตัวเลข 6 หลักเท่านั้น');
-      return;
-    }
-    setItems((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, number: clean }]);
-    resetToIdle();
+  function stopCamera() {
+    loopActiveRef.current = false;
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    setCamOn(false);
+    setLiveGuess(null);
   }
 
-  function resetToIdle() {
-    if (imgUrl) URL.revokeObjectURL(imgUrl);
-    setImgUrl(null);
-    setRect(null);
-    setCandidates([]);
+  useEffect(() => {
+    return () => {
+      loopActiveRef.current = false;
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      workerRef.current?.terminate();
+    };
+  }, []);
+
+  function confirmManual() {
+    const clean = manualNumber.trim();
+    if (!/^\d{6}$/.test(clean)) return;
+    addItem(clean);
     setManualNumber('');
-    setError(null);
-    setStep('idle');
   }
 
   function removeItem(id: string) {
@@ -173,8 +188,8 @@ export default function ScanPage() {
       <h1 className="text-xl font-semibold">สแกนเลข 6 หลักจากสลาก (OCR)</h1>
       <div className="card space-y-2 text-sm text-gray-600">
         <p>
-          ถ่ายรูปเฉพาะแถวเลข 6 หลักตัวใหญ่บนสลากให้ชัดและเต็มเฟรม ระบบจะอ่านด้วย OCR
-          บนเครื่อง (ไม่ส่งภาพขึ้นเซิร์ฟเวอร์) แล้วให้ยืนยันเลขก่อนเพิ่มเข้ารายการทุกครั้ง
+          เปิดกล้อง แล้วจัดแถวเลข 6 หลักตัวใหญ่บนสลากให้อยู่ในกรอบ ระบบจะอ่านและเพิ่มเข้ารายการ
+          ให้อัตโนมัติเมื่ออ่านซ้ำได้ตรงกัน (ประมวลผลบนเครื่องทั้งหมด ไม่ส่งภาพขึ้นเซิร์ฟเวอร์)
         </p>
         <p className="text-amber-700">
           หมายเหตุ: QR/บาร์โค้ดเล็กบนสลากเป็นรหัสเข้ารหัสของ กสอ. ไม่สามารถถอดเป็นเลข 6 หลักได้ตรงๆ
@@ -182,95 +197,63 @@ export default function ScanPage() {
         </p>
       </div>
 
-      {step === 'idle' && (
-        <div className="card">
-          <button className="btn-primary" onClick={pickPhoto}>ถ่ายรูป / เลือกรูปสลาก</button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            capture="environment"
-            className="hidden"
-            onChange={onFileChosen}
-          />
-        </div>
-      )}
+      <div className="card space-y-3">
+        {!camOn ? (
+          <button className="btn-primary" disabled={starting} onClick={startCamera}>
+            {starting ? 'กำลังเปิดกล้อง...' : 'เปิดกล้อง เริ่มสแกน'}
+          </button>
+        ) : (
+          <button className="btn-secondary" onClick={stopCamera}>หยุดกล้อง</button>
+        )}
+        {camError && <div className="text-amber-700 text-sm">{camError}</div>}
 
-      {step === 'cropping' && imgUrl && (
-        <div className="card space-y-3">
-          <div className="text-sm text-gray-600">ลากเลือกกรอบเฉพาะแถวเลข 6 หลัก แล้วกด &quot;อ่านเลข&quot;</div>
+        {camOn && (
           <div
-            ref={imgBoxRef}
-            className="relative inline-block select-none touch-none max-w-full"
-            onMouseDown={(e) => onDragStart(e.clientX, e.clientY)}
-            onMouseMove={(e) => e.buttons === 1 && onDragMove(e.clientX, e.clientY)}
-            onMouseUp={onDragEnd}
-            onTouchStart={(e) => onDragStart(e.touches[0].clientX, e.touches[0].clientY)}
-            onTouchMove={(e) => onDragMove(e.touches[0].clientX, e.touches[0].clientY)}
-            onTouchEnd={onDragEnd}
+            className="relative w-full bg-black rounded-lg overflow-hidden"
+            style={{ aspectRatio: videoSize ? `${videoSize.w} / ${videoSize.h}` : '16 / 9' }}
           >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img ref={imgRef} src={imgUrl} alt="สลาก" className="max-w-full max-h-[70vh] block" draggable={false} />
-            {rect && (
-              <div
-                className="absolute border-2 border-rose-500 bg-rose-500/20 pointer-events-none"
-                style={{
-                  left: `${rect.x * 100}%`,
-                  top: `${rect.y * 100}%`,
-                  width: `${rect.w * 100}%`,
-                  height: `${rect.h * 100}%`,
-                }}
-              />
-            )}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button className="btn-primary" disabled={busy} onClick={() => runOcr(false)}>
-              {busy ? 'กำลังอ่าน...' : 'อ่านเลข (เฉพาะกรอบ)'}
-            </button>
-            <button className="btn-secondary" disabled={busy} onClick={() => runOcr(true)}>
-              อ่านทั้งภาพ
-            </button>
-            <button className="btn-secondary" disabled={busy} onClick={resetToIdle}>ยกเลิก</button>
-          </div>
-        </div>
-      )}
-
-      {step === 'review' && (
-        <div className="card space-y-3">
-          {imgUrl && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={imgUrl} alt="สลาก" className="max-h-40 rounded border" />
-          )}
-          {error && <div className="text-amber-700 text-sm">{error}</div>}
-          {candidates.length > 0 && (
-            <div>
-              <div className="label">เลขที่อ่านได้ (กดเพื่อยืนยัน)</div>
-              <div className="flex flex-wrap gap-2">
-                {candidates.map((c) => (
-                  <button key={c} className="btn-secondary text-lg font-mono" onClick={() => confirmNumber(c)}>
-                    {c}
-                  </button>
-                ))}
+            <video
+              ref={videoRef}
+              className="w-full h-full object-cover"
+              muted
+              playsInline
+              onLoadedMetadata={(e) => {
+                const v = e.currentTarget;
+                setVideoSize({ w: v.videoWidth, h: v.videoHeight });
+              }}
+            />
+            <div
+              className="absolute border-2 border-emerald-400"
+              style={{
+                left: `${GUIDE.x * 100}%`,
+                top: `${GUIDE.y * 100}%`,
+                width: `${GUIDE.w * 100}%`,
+                height: `${GUIDE.h * 100}%`,
+              }}
+            />
+            <div className="absolute inset-x-0 bottom-2 flex justify-center">
+              <div className="px-3 py-1 rounded bg-black/60 text-white text-sm font-mono">
+                {flash ? `เพิ่มแล้ว: ${flash}` : liveGuess ? `กำลังอ่าน: ${liveGuess}` : 'จัดเลขให้อยู่ในกรอบเขียว'}
               </div>
             </div>
-          )}
-          <div>
-            <label className="label">หรือพิมพ์เลขเอง</label>
-            <div className="flex gap-2">
-              <input
-                className="input font-mono"
-                inputMode="numeric"
-                maxLength={6}
-                placeholder="123456"
-                value={manualNumber}
-                onChange={(e) => setManualNumber(e.target.value.replace(/\D/g, '').slice(0, 6))}
-              />
-              <button className="btn-primary" onClick={() => confirmNumber(manualNumber)}>เพิ่ม</button>
-            </div>
           </div>
-          <button className="btn-secondary" onClick={resetToIdle}>สแกนใบถัดไป</button>
+        )}
+
+        <div>
+          <label className="label">หรือพิมพ์เลขเอง</label>
+          <div className="flex gap-2">
+            <input
+              className="input font-mono"
+              inputMode="numeric"
+              maxLength={6}
+              placeholder="123456"
+              value={manualNumber}
+              onChange={(e) => setManualNumber(e.target.value.replace(/\D/g, '').slice(0, 6))}
+            />
+            <button className="btn-primary" onClick={confirmManual}>เพิ่ม</button>
+          </div>
         </div>
-      )}
+      </div>
 
       <div className="card space-y-3">
         <div className="flex items-center justify-between">
@@ -295,4 +278,8 @@ export default function ScanPage() {
       </div>
     </div>
   );
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -39,6 +39,16 @@ export default function ScanPage() {
     } catch {}
   }, []);
 
+  // Attach the stream once the (now-visible) <video> element is mounted/shown,
+  // rather than while it was still display:none — some mobile browsers never
+  // start decoding frames for a hidden video even after it becomes visible.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!camOn || !video || !streamRef.current) return;
+    video.srcObject = streamRef.current;
+    video.play().catch((err) => setCamError(cameraErrorMessage(err)));
+  }, [camOn]);
+
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
@@ -116,10 +126,6 @@ export default function ScanPage() {
         audio: false,
       });
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
 
       if (!workerRef.current) {
         const { createWorker } = await import('tesseract.js');
@@ -208,37 +214,35 @@ export default function ScanPage() {
         )}
         {camError && <div className="text-amber-700 text-sm whitespace-pre-line">{camError}</div>}
 
-        {camOn && (
+        <div
+          className={camOn ? 'relative w-full bg-black rounded-lg overflow-hidden' : 'hidden'}
+          style={{ aspectRatio: videoSize ? `${videoSize.w} / ${videoSize.h}` : '16 / 9' }}
+        >
+          <video
+            ref={videoRef}
+            className="w-full h-full object-cover"
+            muted
+            playsInline
+            onLoadedMetadata={(e) => {
+              const v = e.currentTarget;
+              setVideoSize({ w: v.videoWidth, h: v.videoHeight });
+            }}
+          />
           <div
-            className="relative w-full bg-black rounded-lg overflow-hidden"
-            style={{ aspectRatio: videoSize ? `${videoSize.w} / ${videoSize.h}` : '16 / 9' }}
-          >
-            <video
-              ref={videoRef}
-              className="w-full h-full object-cover"
-              muted
-              playsInline
-              onLoadedMetadata={(e) => {
-                const v = e.currentTarget;
-                setVideoSize({ w: v.videoWidth, h: v.videoHeight });
-              }}
-            />
-            <div
-              className="absolute border-2 border-emerald-400"
-              style={{
-                left: `${GUIDE.x * 100}%`,
-                top: `${GUIDE.y * 100}%`,
-                width: `${GUIDE.w * 100}%`,
-                height: `${GUIDE.h * 100}%`,
-              }}
-            />
-            <div className="absolute inset-x-0 bottom-2 flex justify-center">
-              <div className="px-3 py-1 rounded bg-black/60 text-white text-sm font-mono">
-                {flash ? `เพิ่มแล้ว: ${flash}` : liveGuess ? `กำลังอ่าน: ${liveGuess}` : 'จัดเลขให้อยู่ในกรอบเขียว'}
-              </div>
+            className="absolute border-2 border-emerald-400"
+            style={{
+              left: `${GUIDE.x * 100}%`,
+              top: `${GUIDE.y * 100}%`,
+              width: `${GUIDE.w * 100}%`,
+              height: `${GUIDE.h * 100}%`,
+            }}
+          />
+          <div className="absolute inset-x-0 bottom-2 flex justify-center">
+            <div className="px-3 py-1 rounded bg-black/60 text-white text-sm font-mono">
+              {flash ? `เพิ่มแล้ว: ${flash}` : liveGuess ? `กำลังอ่าน: ${liveGuess}` : 'จัดเลขให้อยู่ในกรอบเขียว'}
             </div>
           </div>
-        )}
+        </div>
 
         <div>
           <label className="label">หรือพิมพ์เลขเอง</label>

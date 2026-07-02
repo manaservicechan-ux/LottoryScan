@@ -106,6 +106,11 @@ export default function ScanPage() {
     setCamError(null);
     setStarting(true);
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          'เบราว์เซอร์นี้ไม่รองรับการขอใช้กล้อง (หรือหน้านี้ไม่ได้เปิดผ่าน HTTPS) ลองเปิดลิงก์นี้ด้วย Chrome แล้วลองใหม่'
+        );
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
@@ -127,11 +132,7 @@ export default function ScanPage() {
       loopActiveRef.current = true;
       scanLoop();
     } catch (err: any) {
-      setCamError(
-        err?.name === 'NotAllowedError'
-          ? 'ไม่ได้รับอนุญาตให้ใช้กล้อง กรุณาอนุญาตการเข้าถึงกล้องแล้วลองใหม่'
-          : 'เปิดกล้องไม่สำเร็จ: ' + (err?.message || String(err))
-      );
+      setCamError(cameraErrorMessage(err));
     } finally {
       setStarting(false);
     }
@@ -205,7 +206,7 @@ export default function ScanPage() {
         ) : (
           <button className="btn-secondary" onClick={stopCamera}>หยุดกล้อง</button>
         )}
-        {camError && <div className="text-amber-700 text-sm">{camError}</div>}
+        {camError && <div className="text-amber-700 text-sm whitespace-pre-line">{camError}</div>}
 
         {camOn && (
           <div
@@ -282,4 +283,27 @@ export default function ScanPage() {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cameraErrorMessage(err: any): string {
+  switch (err?.name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+      return (
+        'ไม่ได้รับอนุญาตให้ใช้กล้อง แก้ไขได้ดังนี้\n' +
+        '1) เช็คสิทธิ์กล้องของแอปเบราว์เซอร์: ตั้งค่ามือถือ → แอป → เบราว์เซอร์ที่ใช้ → สิทธิ์ → กล้อง → อนุญาต\n' +
+        '2) เช็คสิทธิ์เฉพาะเว็บนี้ในตัวเบราว์เซอร์: แตะไอคอนกุญแจ/i ข้าง URL → ตั้งค่าไซต์ → กล้อง → อนุญาต\n' +
+        '3) โหลดหน้าใหม่แล้วกด "เปิดกล้อง เริ่มสแกน" อีกครั้ง'
+      );
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return 'ไม่พบกล้องบนอุปกรณ์นี้';
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return 'เปิดกล้องไม่ได้ อาจมีแอปอื่นกำลังใช้กล้องอยู่ ลองปิดแอปกล้อง/แอปวิดีโอคอลอื่นแล้วลองใหม่';
+    case 'OverconstrainedError':
+      return 'ไม่พบกล้องที่ตรงกับเงื่อนไขที่ขอ ลองใหม่อีกครั้ง';
+    default:
+      return 'เปิดกล้องไม่สำเร็จ: ' + (err?.message || String(err));
+  }
 }
